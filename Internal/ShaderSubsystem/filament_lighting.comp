@@ -1,0 +1,171 @@
+#version 450
+
+/*====================================================================================================================================
+                                                  FILAMENT_LIGHTING.COMP
+====================================================================================================================================*/
+// 🧩 Deferred lighting compute shader — Cook-Torrance GGX + Lambertian diffuse.
+//    Reads GBuffer render targets, outputs HDR lit color.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// ⚙️ Inputs: GBuffer textures
+layout(set = 0, binding = 0) uniform sampler2D gbufferRT0;   // Albedo.RGB + Metallic.A
+layout(set = 0, binding = 1) uniform sampler2D gbufferRT1;   // Normal.XY (octahedral)
+layout(set = 0, binding = 2) uniform sampler2D gbufferRT2;   // Roughness.R + Specular.G
+layout(set = 0, binding = 3) uniform sampler2D gbufferDepth; // Depth
+
+// ⚙️ Output: HDR lit color image
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D outLitColor;
+
+// ⚙️ Scene UBO
+layout(set = 0, binding = 5) uniform SceneUBO
+{
+    mat4 viewMatrix;
+    mat4 projMatrix;
+    mat4 invViewMatrix;
+    vec4 lightDirection;
+    vec4 lightColor;
+    vec4 cameraPosition;
+    vec4 timeAndResolution;
+} scene;
+
+
+//------------------------------------------------------------------------------------------------------------------------
+//                                               OCTAHEDRAL DECODE
+//------------------------------------------------------------------------------------------------------------------------
+
+vec3 decodeOctahedral(vec2 p)
+{
+    vec3 n = vec3(p.xy, 1.0 - abs(p.x) - abs(p.y));
+    if (n.z < 0.0)
+    {
+        n.xy = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0,
+                                          n.y >= 0.0 ? 1.0 : -1.0);
+    }
+    return normalize(n);
+}
+
+
+//------------------------------------------------------------------------------------------------------------------------
+//                                               WORLD POSITION FROM DEPTH
+//------------------------------------------------------------------------------------------------------------------------
+
+vec3 reconstructWorldPosition(vec2 uv, float depth)
+{
+    // ⚙️ Reconstruct clip-space position
+    vec4 clipPos = vec4(uv * 2.0 - 1.0, depth, 1.0);
+    clipPos.y = -clipPos.y;                      // ⚙️ Undo Vulkan Y-flip
+
+    // ⚙️ Unproject from clip to world
+    mat4 invVP = inverse(scene.projMatrix * scene.viewMatrix);
+    vec4 worldPos = invVP * clipPos;
+    return worldPos.xyz / worldPos.w;
+}
+
+
+//------------------------------------------------------------------------------------------------------------------------
+//                                                    PBR FUNCTIONS
+//------------------------------------------------------------------------------------------------------------------------
+
+// ① GGX Normal Distribution Function (NDF)
+//    D(h) = α² / (π · ((N·H)²(α²-1)+1)²)
+float distributionGGX(float NdotH, float roughness)
+{
+    float a  = roughness * roughness;
+    float a2 = a * a;
+    float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / (3.14159265 * denom * denom);
+}
+
+// ② Schlick Fresnel approximation
+//    F(θ) = F0 + (1 - F0)(1 - cosθ)⁵
+vec3 fresnelSchlick(float cosTheta, vec3 F0)
+{
+    float t = 1.0 - cosTheta;
+    float t2 = t * t;
+    return F0 + (1.0 - F0) * (t2 * t2 * t);    // ⚙️ Expanded pow(t, 5) for performance
+}
+
+// ③ Smith height-correlated masking/shadowing (GGX)
+//    G(l, v, h) = 0.5 / (Λ(l) + Λ(v))
+float geometrySmithGGX(float NdotV, float NdotL, float roughness)
+{
+    float a  = roughness * roughness;
+    float a2 = a * a;
+    float gv = NdotL * sqrt(NdotV * NdotV * (1.0 - a2) + a2);
+    float gl = NdotV * sqrt(NdotL * NdotL * (1.0 - a2) + a2);
+    return 0.5 / max(gv + gl, 0.0001);
+}
+
+
+//------------------------------------------------------------------------------------------------------------------------
+//                                                    MAIN
+//------------------------------------------------------------------------------------------------------------------------
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims  = imageSize(outLitColor);
+
+    if (pixel.x >= dims.x || pixel.y >= dims.y) return;
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(dims);
+
+    // ① Sample GBuffer
+    vec4 rt0   = textureLod(gbufferRT0, uv, 0);
+    vec2 rt1   = textureLod(gbufferRT1, uv, 0).rg;
+    vec2 rt2   = textureLod(gbufferRT2, uv, 0).rg;
+    float depth = textureLod(gbufferDepth, uv, 0).r;
+
+    // ② Early out for sky pixels
+    if (depth >= 1.0)
+    {
+        // ⚙️ Sky gradient
+        vec3 skyColor = mix(vec3(0.15, 0.18, 0.25), vec3(0.4, 0.5, 0.7), uv.y);
+        imageStore(outLitColor, pixel, vec4(skyColor, 1.0));
+        return;
+    }
+
+    // ③ Unpack GBuffer
+    vec3  albedo     = rt0.rgb;
+    float metallic   = rt0.a;
+    vec3  normal     = decodeOctahedral(rt1);
+    float roughness  = rt2.r;
+    float specularF0 = rt2.g;
+
+    // ④ Reconstruct world position
+    vec3 worldPos = reconstructWorldPosition(uv, depth);
+
+    // ⑤ Lighting vectors
+    vec3 V = normalize(scene.cameraPosition.xyz - worldPos);
+    vec3 L = normalize(-scene.lightDirection.xyz);
+    vec3 H = normalize(V + L);
+
+    float NdotL = max(dot(normal, L), 0.0);
+    float NdotV = max(dot(normal, V), 0.001);
+    float NdotH = max(dot(normal, H), 0.0);
+    float VdotH = max(dot(V, H),      0.0);
+
+    // ⑥ Fresnel at normal incidence
+    vec3 F0 = mix(vec3(specularF0), albedo, metallic);
+
+    // ⑦ Cook-Torrance specular BRDF
+    float D   = distributionGGX(NdotH, roughness);
+    vec3  F   = fresnelSchlick(VdotH, F0);
+    float G   = geometrySmithGGX(NdotV, NdotL, roughness);
+    vec3  specular = D * F * G;                  // ⚙️ G already has 1/(4·NdotV·NdotL) baked in
+
+    // ⑧ Lambertian diffuse (energy conserving)
+    vec3 kD = (1.0 - F) * (1.0 - metallic);
+    vec3 diffuse = kD * albedo / 3.14159265;
+
+    // ⑨ Final radiance
+    vec3 lightRadiance = scene.lightColor.rgb * scene.lightColor.w;
+    vec3 Lo = (diffuse + specular) * lightRadiance * NdotL;
+
+    // ⑩ Ambient term (very simple hemisphere)
+    vec3 ambient = albedo * 0.03 * (1.0 - metallic);
+    Lo += ambient;
+
+    imageStore(outLitColor, pixel, vec4(Lo, 1.0));
+}

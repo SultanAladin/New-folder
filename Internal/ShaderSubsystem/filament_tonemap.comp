@@ -1,0 +1,73 @@
+#version 450
+
+/*====================================================================================================================================
+                                                  FILAMENT_TONEMAP.COMP
+====================================================================================================================================*/
+// 🧩 Tonemapping compute shader — ACES filmic + gamma correction.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// ⚙️ Input: HDR image
+layout(set = 0, binding = 0) uniform sampler2D hdrInput;
+
+// ⚙️ Unused bindings (bound for layout compatibility)
+layout(set = 0, binding = 1) uniform sampler2D unused1;
+layout(set = 0, binding = 2) uniform sampler2D unused2;
+layout(set = 0, binding = 3) uniform sampler2D unused3;
+
+// ⚙️ Output: LDR tonemapped image
+layout(set = 0, binding = 4, rgba8) uniform writeonly image2D outTonemapped;
+
+// ⚙️ Scene UBO (for time/resolution if needed)
+layout(set = 0, binding = 5) uniform SceneUBO
+{
+    mat4 viewMatrix;
+    mat4 projMatrix;
+    mat4 invViewMatrix;
+    vec4 lightDirection;
+    vec4 lightColor;
+    vec4 cameraPosition;
+    vec4 timeAndResolution;
+} scene;
+
+
+//------------------------------------------------------------------------------------------------------------------------
+//                                                    ACES FILMIC
+//------------------------------------------------------------------------------------------------------------------------
+
+// ⚙️ ACES filmic curve (Narkowicz 2015)
+//    Attempt to approximate the full ACES RRT+ODT with a single curve
+
+vec3 acesFilmic(vec3 x)
+{
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+
+//------------------------------------------------------------------------------------------------------------------------
+//                                                    MAIN
+//------------------------------------------------------------------------------------------------------------------------
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims  = imageSize(outTonemapped);
+
+    if (pixel.x >= dims.x || pixel.y >= dims.y) return;
+
+    vec2 uv  = (vec2(pixel) + 0.5) / vec2(dims);
+    vec3 hdr = textureLod(hdrInput, uv, 0).rgb;
+
+    // ① Apply ACES filmic tonemapping
+    vec3 ldr = acesFilmic(hdr);
+
+    // ② Linear → sRGB gamma correction
+    ldr = pow(ldr, vec3(1.0 / 2.2));
+
+    imageStore(outTonemapped, pixel, vec4(ldr, 1.0));
+}
